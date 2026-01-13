@@ -50,8 +50,24 @@ func main() {
 		}
 	}()
 
-	// Simulate execution
-	time.Sleep(8 * time.Second)
+	start := time.Now()
+
+    // Simulate execution
+    time.Sleep(3 * time.Second)
+
+    duration := time.Since(start)
+
+    err = redisq.UpdateWorkerMetrics(
+	    context.Background(),
+	    rdb,
+	    worker.ID,
+	    worker.Type,
+	    duration,
+    )
+    if err != nil {
+	    fmt.Println("Failed to update metrics:", err)
+    }
+
 
 	// Stop heartbeat
 	close(stopHB)
