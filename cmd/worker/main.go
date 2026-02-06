@@ -17,6 +17,8 @@ import (
 	redisq "github.com/ak3tsm7/latency-aware-task-queue/internal/redis"
 )
 
+var errJobCancelled = errors.New("job cancelled")
+
 func main() {
 	ctx := context.Background()
 	rateLimitPerMinute := envInt("RATE_LIMIT_PER_MINUTE", 60)
@@ -76,6 +78,13 @@ func main() {
 		fmt.Printf("   Task: %s | Type: %s | Priority: %d\n",
 			job.TaskType, job.Requires, job.Priority)
 
+		// Pre-run cancellation check
+		if cancelled, _ := rdb.Exists(ctx, fmt.Sprintf("cancelled:%s", job.ID)).Result(); cancelled > 0 {
+			fmt.Println("Job marked cancelled before start - skipping")
+			markCancelled(ctx, rdb, job)
+			continue
+		}
+
 		heartbeatKey := fmt.Sprintf("heartbeat:%s", worker.ID)
 		runningKey := fmt.Sprintf("running:%s", worker.ID)
 
@@ -121,9 +130,36 @@ func main() {
 		start := time.Now()
 		var execErr error
 
+		// Respect job timeout
+		timeout := time.Duration(job.TimeoutMs) * time.Millisecond
+		if timeout <= 0 {
+			timeout = 30 * time.Second
+		}
+		execCtx, execCancel := context.WithTimeout(ctx, timeout)
+
+		// Simulate work with cancellation/timeout awareness
 		executionTime := time.Duration(2+job.Priority%3) * time.Second
-		fmt.Printf("   Executing for %v...\n", executionTime)
-		time.Sleep(executionTime)
+		fmt.Printf("   Executing for %v (timeout %v)...\n", executionTime, timeout)
+
+		workDone := make(chan struct{})
+		go func() {
+			time.Sleep(executionTime)
+			close(workDone)
+		}()
+
+		select {
+		case <-workDone:
+			// completed
+		case <-execCtx.Done():
+			execErr = execCtx.Err()
+		}
+		execCancel()
+
+		// Check cancellation flag after work/timeout
+		cancelled, _ := rdb.Exists(ctx, fmt.Sprintf("cancelled:%s", job.ID)).Result()
+		if cancelled > 0 && execErr == nil {
+			execErr = errJobCancelled
+		}
 
 		if v, ok := job.Payload["should_fail"].(bool); ok && v {
 			execErr = errors.New("simulated job failure (payload.should_fail=true)")
@@ -162,8 +198,15 @@ func main() {
 
 		jobKey := fmt.Sprintf("job:%s", job.ID)
 		if execErr != nil {
-			if err := redisq.HandleJobFailure(ctx, rdb, *job, execErr); err != nil {
-				fmt.Println("Failed to record job failure:", err)
+			if errors.Is(execErr, context.DeadlineExceeded) {
+				execErr = fmt.Errorf("job timeout after %v", timeout)
+			}
+			if errors.Is(execErr, errJobCancelled) || execErr.Error() == "job cancelled" {
+				markCancelled(ctx, rdb, job)
+			} else {
+				if err := redisq.HandleJobFailure(ctx, rdb, *job, execErr); err != nil {
+					fmt.Println("Failed to record job failure:", err)
+				}
 			}
 		} else {
 			rdb.Del(ctx, jobKey)
@@ -200,4 +243,12 @@ func requeueJob(ctx context.Context, rdb *redis.Client, job *models.Job) {
 	})
 	jobKey := fmt.Sprintf("job:%s", job.ID)
 	rdb.HSet(ctx, jobKey, "status", "queued")
+}
+
+func markCancelled(ctx context.Context, rdb *redis.Client, job *models.Job) {
+	jobKey := fmt.Sprintf("job:%s", job.ID)
+	rdb.HSet(ctx, jobKey, map[string]interface{}{
+		"status": "cancelled",
+		"error":  "job cancelled",
+	})
 }

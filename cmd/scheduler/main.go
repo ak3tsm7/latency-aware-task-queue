@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -33,6 +34,28 @@ func main() {
 
 	rdb := redis.NewClient(&redis.Options{
 		Addr: "localhost:6379",
+	})
+
+	// Job cancellation endpoint: DELETE /api/jobs/{id}/cancel
+	http.HandleFunc("/api/jobs/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/jobs/"), "/")
+		if len(parts) != 2 || parts[1] != "cancel" || parts[0] == "" {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		jobID := parts[0]
+		cancelKey := fmt.Sprintf("cancelled:%s", jobID)
+		if err := rdb.Set(ctx, cancelKey, "1", time.Hour).Err(); err != nil {
+			http.Error(w, "failed to cancel job", http.StatusInternalServerError)
+			return
+		}
+		rdb.HSet(ctx, fmt.Sprintf("job:%s", jobID), "status", "cancelled")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("cancelled"))
 	})
 
 	// Test Redis connection
