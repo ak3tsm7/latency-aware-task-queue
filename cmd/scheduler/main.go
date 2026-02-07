@@ -53,7 +53,10 @@ func main() {
 			http.Error(w, "failed to cancel job", http.StatusInternalServerError)
 			return
 		}
-		rdb.HSet(ctx, fmt.Sprintf("job:%s", jobID), "status", "cancelled")
+		rdb.HSet(ctx, fmt.Sprintf("job:%s", jobID), map[string]interface{}{
+			"status": "cancelled",
+			"error":  "job cancelled",
+		})
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("cancelled"))
 	})
