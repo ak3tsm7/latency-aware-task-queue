@@ -211,8 +211,22 @@ func main() {
 					fmt.Println("Failed to record job failure:", err)
 				}
 			}
+			// Record completion metadata for bench/source tracking
+			rdb.HSet(ctx, jobKey, map[string]interface{}{
+				"status":           "failed",
+				"completed_at_ns":  time.Now().UnixNano(),
+				"error":            execErr.Error(),
+			})
 		} else {
-			rdb.Del(ctx, jobKey)
+			// For bench/source=bench, keep job record to allow latency calculation; otherwise delete.
+			if job.Metadata["source"] == "bench" {
+				rdb.HSet(ctx, jobKey, map[string]interface{}{
+					"status":          "succeeded",
+					"completed_at_ns": time.Now().UnixNano(),
+				})
+			} else {
+				rdb.Del(ctx, jobKey)
+			}
 		}
 
 		metricsData, _ := rdb.HGetAll(ctx, "metrics:"+worker.ID).Result()

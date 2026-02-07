@@ -31,3 +31,9 @@ If `max_retries` is `0`, the system defaults to `3`.
   ```
 - Env overrides: `REDIS_ADDR`, `BENCH_JOBS`, `BENCH_CONCURRENCY`, `BENCH_QUEUE`, `BENCH_TIMEOUT_MS`, `BENCH_FAIL` (bool), `BENCH_PAYLOAD_BYTES` (int).
 - Output shows remaining/running/queued/dlq counts until all benchmark jobs finish. Use alongside running workers for load testing.
+
+### Sample Benchmark (local)
+- Command: `bin/bench.exe -jobs 2000 -concurrency 40 -queue cpu -timeout 6000`
+- Environment: 40 workers (RATE_LIMIT_PER_MINUTE=100000), scheduler running, Redis local.
+- Results: throughput 8.58 jobs/sec; latency p50/p95/p99 (ms): 157238 / 226262 / 232307; success 2000; failed 0; cancelled 0; dlq 0; duration 233.04 s.
+See `BENCHMARKS.md` for details.

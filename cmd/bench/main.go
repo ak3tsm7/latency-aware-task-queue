@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"strconv"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -47,7 +48,8 @@ func main() {
 	waitForDrain(ctx, rdb, jobIDs)
 	duration := time.Since(start)
 
-	log.Printf("Benchmark complete in %v", duration)
+	summary := collectSummary(ctx, rdb, jobIDs, duration)
+	printSummary(summary)
 }
 
 func parseFlags() benchConfig {
@@ -91,7 +93,10 @@ func enqueueJobs(ctx context.Context, rdb *redis.Client, cfg benchConfig) []stri
 						"should_fail": cfg.shouldFail,
 						"padding":     strings.Repeat("x", cfg.payloadSize),
 					},
-					Metadata: map[string]string{"source": "bench"},
+					Metadata: map[string]string{
+						"source":        "bench",
+						"t_enqueue_ns": fmt.Sprintf("%d", time.Now().UnixNano()),
+					},
 					MaxRetries:   2,
 					RetryBackoff: "linear",
 				}
@@ -136,6 +141,19 @@ type pendingInfo struct {
 	running int
 	queued  int
 	dlq     int
+}
+
+type summary struct {
+	Jobs           int
+	Throughput     float64
+	P50            float64
+	P95            float64
+	P99            float64
+	Success        int
+	Failed         int
+	Cancelled      int
+	DLQ            int
+	DurationSec    float64
 }
 
 func pendingJobs(ctx context.Context, rdb *redis.Client, target map[string]struct{}) (int, pendingInfo) {
@@ -185,6 +203,117 @@ func pendingJobs(ctx context.Context, rdb *redis.Client, target map[string]struc
 		}
 	}
 	return remaining, info
+}
+
+func collectSummary(ctx context.Context, rdb *redis.Client, jobIDs []string, wall time.Duration) summary {
+	latencies := make([]float64, 0, len(jobIDs))
+	var succ, fail, cancel int
+
+	for _, id := range jobIDs {
+		jobKey := fmt.Sprintf("job:%s", id)
+		h, _ := rdb.HGetAll(ctx, jobKey).Result()
+
+		status := h["status"]
+		switch status {
+		case "cancelled":
+			cancel++
+		case "failed":
+			fail++
+		case "queued", "running", "retry_scheduled":
+			// treat as failed-to-complete
+			fail++
+		default:
+			succ++
+		}
+
+		tEnqStr := h["metadata"]
+		var tEnq int64
+		if tEnqStr != "" {
+			// metadata JSON stored separately; but enqueue time was stored in Metadata map; try payload metadata if not
+		}
+		if metaStr := h["metadata"]; metaStr != "" {
+			var meta map[string]string
+			_ = json.Unmarshal([]byte(metaStr), &meta)
+			if v, ok := meta["t_enqueue_ns"]; ok {
+				tEnq, _ = strconv.ParseInt(v, 10, 64)
+			}
+		}
+
+		tDone, _ := strconv.ParseInt(h["completed_at_ns"], 10, 64)
+		if tEnq > 0 && tDone > tEnq {
+			lat := float64(tDone-tEnq) / 1e6 // ms
+			latencies = append(latencies, lat)
+		}
+	}
+
+	sort.Float64s(latencies)
+	p50, p95, p99 := percentile(latencies, 50), percentile(latencies, 95), percentile(latencies, 99)
+
+	dlq := countDLQ(ctx, rdb, jobIDs)
+
+	return summary{
+		Jobs:        len(jobIDs),
+		Throughput:  float64(len(jobIDs)) / wall.Seconds(),
+		P50:         p50,
+		P95:         p95,
+		P99:         p99,
+		Success:     succ,
+		Failed:      fail,
+		Cancelled:   cancel,
+		DLQ:         dlq,
+		DurationSec: wall.Seconds(),
+	}
+}
+
+func countDLQ(ctx context.Context, rdb *redis.Client, jobIDs []string) int {
+	set := make(map[string]struct{}, len(jobIDs))
+	for _, id := range jobIDs {
+		set[id] = struct{}{}
+	}
+	dlqIDs, _ := rdb.ZRange(ctx, "dlq:failed", 0, -1).Result()
+	cnt := 0
+	for _, id := range dlqIDs {
+		if _, ok := set[id]; ok {
+			cnt++
+		}
+	}
+	return cnt
+}
+
+func percentile(vals []float64, p float64) float64 {
+	if len(vals) == 0 {
+		return 0
+	}
+	if p <= 0 {
+		return vals[0]
+	}
+	if p >= 100 {
+		return vals[len(vals)-1]
+	}
+	idx := (p / 100.0) * float64(len(vals)-1)
+	i := int(idx)
+	f := idx - float64(i)
+	if i+1 < len(vals) {
+		return vals[i] + f*(vals[i+1]-vals[i])
+	}
+	return vals[i]
+}
+
+func printSummary(s summary) {
+	out := map[string]interface{}{
+		"jobs":                    s.Jobs,
+		"throughput_jobs_per_sec": s.Throughput,
+		"latency_ms": map[string]float64{
+			"p50": s.P50, "p95": s.P95, "p99": s.P99,
+		},
+		"success":    s.Success,
+		"failed":     s.Failed,
+		"cancelled":  s.Cancelled,
+		"dlq":        s.DLQ,
+		"duration_s": s.DurationSec,
+	}
+	b, _ := json.MarshalIndent(out, "", "  ")
+	fmt.Println(string(b))
 }
 
 // util helpers
